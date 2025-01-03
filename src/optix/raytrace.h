@@ -20,14 +20,12 @@
 
 #include <optix.h>
 
-
-NGP_NAMESPACE_BEGIN
+namespace ngp {
 
 struct Raytrace {
-	struct Params
-	{
-		Eigen::Vector3f* ray_origins;
-		Eigen::Vector3f* ray_directions;
+	struct Params {
+		vec3* ray_origins;
+		vec3* ray_directions;
 		const Triangle* triangles;
 		OptixTraversableHandle handle;
 	};
@@ -37,4 +35,4 @@ struct Raytrace {
 	struct HitGroupData {};
 };
 
-NGP_NAMESPACE_END
+}

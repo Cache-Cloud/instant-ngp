@@ -20,12 +20,11 @@
 
 #include <optix.h>
 
-NGP_NAMESPACE_BEGIN
+namespace ngp {
 
 struct PathEscape {
-	struct Params
-	{
-		const Eigen::Vector3f* ray_origins;
+	struct Params {
+		const vec3* ray_origins;
 		const Triangle* triangles;
 		float* distances;
 		OptixTraversableHandle handle;
@@ -36,4 +35,4 @@ struct PathEscape {
 	struct HitGroupData {};
 };
 
-NGP_NAMESPACE_END
+}

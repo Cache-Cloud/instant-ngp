@@ -12,58 +12,33 @@
  *  @author Thomas Müller & Alex Evans, NVIDIA
  */
 
-
 #pragma once
 
 #include <neural-graphics-primitives/common.h>
+#include <neural-graphics-primitives/nerf_device.cuh>
 
-#include <tiny-cuda-nn/gpu_memory.h>
-
-
-NGP_NAMESPACE_BEGIN
-
-inline constexpr __device__ uint32_t NERF_GRIDSIZE() { return 128; } // size of the density/occupancy grid.
-
-struct NerfPayload {
-	Eigen::Vector3f origin;
-	Eigen::Vector3f dir;
-	float t;
-	uint32_t idx;
-	uint16_t n_steps;
-	bool alive;
-};
+namespace ngp {
 
 struct RaysNerfSoa {
-	void enlarge(size_t n_elements) {
-		rgba.enlarge(n_elements);
-		payload.enlarge(n_elements);
-	}
-#ifdef __NVCC__
+#if defined(__CUDACC__) || (defined(__clang__) && defined(__CUDA__))
 	void copy_from_other_async(const RaysNerfSoa& other, cudaStream_t stream) {
-		CUDA_CHECK_THROW(cudaMemcpyAsync(rgba.data(), other.rgba.data(), rgba.get_bytes(), cudaMemcpyDeviceToDevice, stream));
-		CUDA_CHECK_THROW(cudaMemcpyAsync(payload.data(), other.payload.data(), payload.get_bytes(), cudaMemcpyDeviceToDevice, stream));
+		CUDA_CHECK_THROW(cudaMemcpyAsync(rgba, other.rgba, size * sizeof(vec4), cudaMemcpyDeviceToDevice, stream));
+		CUDA_CHECK_THROW(cudaMemcpyAsync(depth, other.depth, size * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+		CUDA_CHECK_THROW(cudaMemcpyAsync(payload, other.payload, size * sizeof(NerfPayload), cudaMemcpyDeviceToDevice, stream));
 	}
 #endif
-	tcnn::GPUMemory<Eigen::Array4f> rgba;
-	tcnn::GPUMemory<NerfPayload> payload;
+
+	void set(vec4* rgba, float* depth, NerfPayload* payload, size_t size) {
+		this->rgba = rgba;
+		this->depth = depth;
+		this->payload = payload;
+		this->size = size;
+	}
+
+	vec4* rgba;
+	float* depth;
+	NerfPayload* payload;
+	size_t size;
 };
 
-
-struct NerfPosition {
-	NGP_HOST_DEVICE NerfPosition(const Eigen::Vector3f& pos, float dt) : p{pos} {}
-	Eigen::Vector3f p;
-};
-
-struct NerfDirection {
-	NGP_HOST_DEVICE NerfDirection(const Eigen::Vector3f& dir, float dt) : d{dir} {}
-	Eigen::Vector3f d;
-};
-
-struct NerfCoordinate {
-	NGP_HOST_DEVICE NerfCoordinate(const Eigen::Vector3f& pos, const Eigen::Vector3f& dir, float dt) : pos{pos, dt}, dt{dt}, dir{dir, dt} {}
-	NerfPosition pos;
-	float dt;
-	NerfDirection dir;
-};
-
-NGP_NAMESPACE_END
+}

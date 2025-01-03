@@ -15,62 +15,29 @@
 
 #pragma once
 
-#include <tinylogger/tinylogger.h>
-
-// Eigen uses __device__ __host__ on a bunch of defaulted constructors.
-// This doesn't actually cause unwanted behavior, but does cause NVCC
-// to emit this diagnostic.
-// nlohmann::json produces a comparison with zero in one of its templates,
-// which can also safely be ignored.
-#if defined(__NVCC__)
-#  if defined __NVCC_DIAG_PRAGMA_SUPPORT__
-#    pragma nv_diag_suppress = esa_on_defaulted_function_ignored
-#    pragma nv_diag_suppress = unsigned_compare_with_zero
-#  else
-#    pragma diag_suppress = esa_on_defaulted_function_ignored
-#    pragma diag_suppress = unsigned_compare_with_zero
-#  endif
+#ifdef _WIN32
+#  define NOMINMAX
 #endif
-#include <Eigen/Dense>
 
-#define NGP_NAMESPACE_BEGIN namespace ngp {
-#define NGP_NAMESPACE_END }
+#include <tiny-cuda-nn/common.h>
+using namespace tcnn;
+
 
 #if defined(__CUDA_ARCH__)
-	#if defined(__CUDACC_RTC__) || (defined(__clang__) && defined(__CUDA__))
-		#define NGP_PRAGMA_UNROLL _Pragma("unroll")
-		#define NGP_PRAGMA_NO_UNROLL _Pragma("unroll 1")
-	#else
-		#define NGP_PRAGMA_UNROLL #pragma unroll
-		#define NGP_PRAGMA_NO_UNROLL #pragma unroll 1
-	#endif
+	#define NGP_PRAGMA_UNROLL _Pragma("unroll")
+	#define NGP_PRAGMA_NO_UNROLL _Pragma("unroll 1")
 #else
 	#define NGP_PRAGMA_UNROLL
 	#define NGP_PRAGMA_NO_UNROLL
 #endif
 
-#include <functional>
+#if defined(__CUDACC__) || (defined(__clang__) && defined(__CUDA__))
+#define NGP_HOST_DEVICE __host__ __device__
+#else
+#define NGP_HOST_DEVICE
+#endif
 
-
-NGP_NAMESPACE_BEGIN
-
-using Vector2i32 = Eigen::Matrix<uint32_t, 2, 1>;
-using Vector3i16 = Eigen::Matrix<uint16_t, 3, 1>;
-using Vector4i16 = Eigen::Matrix<uint16_t, 4, 1>;
-using Vector4i32 = Eigen::Matrix<uint32_t, 4, 1>;
-
-static constexpr uint32_t BATCH_SIZE_MULTIPLE = 256;
-
-class ScopeGuard {
-public:
-    ScopeGuard(const std::function<void()>& callback) : mCallback{callback} {}
-    ScopeGuard(std::function<void()>&& callback) : mCallback{std::move(callback)} {}
-    ScopeGuard(const ScopeGuard& other) = delete;
-    ScopeGuard(ScopeGuard&& other) { mCallback = std::move(other.mCallback); other.mCallback = {}; }
-    ~ScopeGuard() { mCallback(); }
-private:
-    std::function<void()> mCallback;
-};
+namespace ngp {
 
 enum class EMeshRenderMode : int {
 	Off,
@@ -79,21 +46,26 @@ enum class EMeshRenderMode : int {
 	FaceIDs,
 };
 
+enum class EGroundTruthRenderMode : int {
+	Shade,
+	Depth,
+	NumRenderModes,
+};
+static constexpr const char* GroundTruthRenderModeStr = "Shade\0Depth\0\0";
+
 enum class ERenderMode : int {
 	AO,
 	Shade,
 	Normals,
 	Positions,
 	Depth,
-	Distance,
-	Stepsize,
 	Distortion,
 	Cost,
 	Slice,
 	NumRenderModes,
 	EncodingVis, // EncodingVis exists outside of the standard render modes
 };
-static constexpr const char* RenderModeStr = "AO\0Shade\0Normals\0Positions\0Depth\0Distance\0Stepsize\0Distortion\0Cost\0Slice\0\0";
+static constexpr const char* RenderModeStr = "AO\0Shade\0Normals\0Positions\0Depth\0Distortion\0Cost\0Slice\0\0";
 
 enum class ERandomMode : int {
 	Random,
@@ -109,11 +81,11 @@ enum class ELossType : int {
 	L1,
 	Mape,
 	Smape,
-	SmoothL1,
+	Huber,
 	LogL1,
 	RelativeL2,
 };
-static constexpr const char* LossTypeStr = "L2\0L1\0MAPE\0SMAPE\0SmoothL1\0LogL1\0RelativeL2\0\0";
+static constexpr const char* LossTypeStr = "L2\0L1\0MAPE\0SMAPE\0Huber\0LogL1\0RelativeL2\0\0";
 
 enum class ENerfActivation : int {
 	None,
@@ -145,36 +117,91 @@ enum class ETonemapCurve : int {
 };
 static constexpr const char* TonemapCurveStr = "Identity\0ACES\0Hable\0Reinhard\0\0";
 
+enum class EDlssQuality : int {
+	UltraPerformance,
+	MaxPerformance,
+	Balanced,
+	MaxQuality,
+	UltraQuality,
+	NumDlssQualitySettings,
+	None,
+};
+static constexpr const char* DlssQualityStr = "UltraPerformance\0MaxPerformance\0Balanced\0MaxQuality\0UltraQuality\0Invalid\0None\0\0";
+static constexpr const char* DlssQualityStrArray[] = {"UltraPerformance", "MaxPerformance", "Balanced", "MaxQuality", "UltraQuality", "Invalid", "None"};
+
 enum class ETestbedMode : int {
 	Nerf,
 	Sdf,
 	Image,
 	Volume,
+	None,
+};
+
+enum class EMlpAlgorithm : int {
+	MMA,
+	FMA,
+};
+
+enum class ESDFGroundTruthMode : int {
+	RaytracedMesh,
+	SpheretracedMesh,
+	SDFBricks,
 };
 
 struct Ray {
-	Eigen::Vector3f o;
-	Eigen::Vector3f d;
-};
+	vec3 o;
+	vec3 d;
 
-struct CameraDistortion {
-	float params[4] = {};
-#ifdef __NVCC__
-	inline __host__ __device__ bool is_zero() const {
-		return params[0] == 0.0f && params[1] == 0.0f && params[2] == 0.0f && params[3] == 0.0f;
+	NGP_HOST_DEVICE vec3 operator()(float t) const {
+		return o + t * d;
 	}
-#endif
+
+	NGP_HOST_DEVICE void advance(float t) {
+		o += d * t;
+	}
+
+	NGP_HOST_DEVICE float distance_to(const vec3& p) const {
+		vec3 nearest = p - o;
+		nearest -= d * dot(nearest, d) / length2(d);
+		return length(nearest);
+	}
+
+	NGP_HOST_DEVICE bool is_valid() const {
+		return d != vec3(0.0f);
+	}
+
+	static NGP_HOST_DEVICE Ray invalid() {
+		return {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+	}
 };
 
-#ifdef __NVCC__
-#define NGP_HOST_DEVICE __host__ __device__
-#else
-#define NGP_HOST_DEVICE
-#endif
+struct TrainingXForm {
+	NGP_HOST_DEVICE bool operator==(const TrainingXForm& other) const {
+		return start == other.start && end == other.end;
+	}
 
-inline NGP_HOST_DEVICE float sign(float x) {
-	return copysignf(1.0, x);
+	mat4x3 start;
+	mat4x3 end;
+};
+
+enum class ELensMode : int {
+	Perspective,
+	OpenCV,
+	FTheta,
+	LatLong,
+	OpenCVFisheye,
+	Equirectangular,
+};
+static constexpr const char* LensModeStr = "Perspective\0OpenCV\0F-Theta\0LatLong\0OpenCV Fisheye\0Equirectangular\0\0";
+
+inline NGP_HOST_DEVICE bool supports_dlss(ELensMode mode) {
+	return mode == ELensMode::Perspective || mode == ELensMode::OpenCV || mode == ELensMode::OpenCVFisheye;
 }
+
+struct Lens {
+	ELensMode mode = ELensMode::Perspective;
+	float params[7] = {};
+};
 
 inline NGP_HOST_DEVICE uint32_t binary_search(float val, const float* data, uint32_t length) {
 	if (length == 0) {
@@ -198,7 +225,47 @@ inline NGP_HOST_DEVICE uint32_t binary_search(float val, const float* data, uint
 		}
 	}
 
-	return std::min(first, length-1);
+	return min(first, length-1);
 }
 
-NGP_NAMESPACE_END
+template <typename T>
+struct Buffer2DView {
+	T* data = nullptr;
+	ivec2 resolution = 0;
+
+	// Lookup via integer pixel position (no bounds checking)
+	NGP_HOST_DEVICE T at(const ivec2& px) const {
+		return data[px.x + px.y * resolution.x];
+	}
+
+	// Lookup via UV coordinates in [0,1]^2
+	NGP_HOST_DEVICE T at(const vec2& uv) const {
+		ivec2 px = clamp(ivec2(vec2(resolution) * uv), 0, resolution - 1);
+		return at(px);
+	}
+
+	// Lookup via UV coordinates in [0,1]^2 and LERP the nearest texels
+	NGP_HOST_DEVICE T at_lerp(const vec2& uv) const {
+		const vec2 px_float = vec2(resolution) * uv;
+		const ivec2 px = ivec2(px_float);
+
+		const vec2 weight = px_float - vec2(px);
+
+		auto read_val = [&](ivec2 pos) {
+			return at(clamp(pos, 0, resolution - 1));
+		};
+
+		return (
+			(1 - weight.x) * (1 - weight.y) * read_val({px.x, px.y}) +
+			(weight.x) * (1 - weight.y) * read_val({px.x+1, px.y}) +
+			(1 - weight.x) * (weight.y) * read_val({px.x, px.y+1}) +
+			(weight.x) * (weight.y) * read_val({px.x+1, px.y+1})
+		);
+	}
+
+	NGP_HOST_DEVICE operator bool() const {
+		return data;
+	}
+};
+
+}

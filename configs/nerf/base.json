@@ -1,6 +1,6 @@
 {
 	"loss": {
-		"otype": "SmoothL1"
+		"otype": "Huber"
 	},
 	"optimizer": {
 		"otype": "Ema",
@@ -22,8 +22,8 @@
 	},
 	"encoding": {
 		"otype": "HashGrid",
-		"n_levels": 16,
-		"n_features_per_level": 2,
+		"n_levels": 8,
+		"n_features_per_level": 4,
 		"log2_hashmap_size": 19,
 		"base_resolution": 16
 	},
@@ -35,8 +35,17 @@
 		"n_hidden_layers": 1
 	},
 	"dir_encoding": {
-		"otype": "SphericalHarmonics",
-		"degree": 4
+		"otype": "Composite",
+		"nested": [
+			{
+				"n_dims_to_encode": 3,
+				"otype": "SphericalHarmonics",
+				"degree": 4
+			},
+			{
+				"otype": "Identity"
+			}
+		]
 	},
 	"rgb_network": {
 		"otype": "FullyFusedMLP",
@@ -91,3 +100,4 @@
 		}
 	}
 }
+

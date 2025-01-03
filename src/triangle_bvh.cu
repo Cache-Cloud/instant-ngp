@@ -12,11 +12,10 @@
  *  @author Thomas Müller & Alex Evans, NVIDIA
  */
 
-#include <neural-graphics-primitives/common.h>
+#include <neural-graphics-primitives/common_host.h>
 #include <neural-graphics-primitives/triangle_bvh.cuh>
-#include <tiny-cuda-nn/gpu_memory.h>
 
-#include <Eigen/Dense>
+#include <tiny-cuda-nn/gpu_memory.h>
 
 #include <stack>
 
@@ -40,19 +39,47 @@ namespace optix_ptx {
 }
 #endif //NGP_OPTIX
 
-using namespace Eigen;
-using namespace tcnn;
-
-
-NGP_NAMESPACE_BEGIN
+namespace ngp {
 
 constexpr float MAX_DIST = 10.0f;
-constexpr float MAX_DIST_SQ = MAX_DIST*MAX_DIST;
 
 #ifdef NGP_OPTIX
 OptixDeviceContext g_optix;
 
 namespace optix {
+	bool initialize() {
+		static bool ran_before = false;
+		static bool is_optix_initialized = false;
+		if (ran_before) {
+			return is_optix_initialized;
+		}
+
+		ran_before = true;
+
+		// Initialize CUDA with a no-op call to the the CUDA runtime API
+		CUDA_CHECK_THROW(cudaFree(nullptr));
+
+		try {
+			// Initialize the OptiX API, loading all API entry points
+			OPTIX_CHECK_THROW(optixInit());
+
+			// Specify options for this context. We will use the default options.
+			OptixDeviceContextOptions options = {};
+
+			// Associate a CUDA context (and therefore a specific GPU) with this
+			// device context
+			CUcontext cuCtx = 0; // NULL means take the current active context
+
+			OPTIX_CHECK_THROW(optixDeviceContextCreate(cuCtx, &options, &g_optix));
+		} catch (std::exception& e) {
+			tlog::warning() << "OptiX failed to initialize: " << e.what();
+			return false;
+		}
+
+		is_optix_initialized = true;
+		return true;
+	}
+
 	class Gas {
 	public:
 		Gas(const GPUMemory<Triangle>& triangles, OptixDeviceContext optix, cudaStream_t stream) {
@@ -111,10 +138,10 @@ namespace optix {
 }
 #endif //NGP_OPTIX
 
-__global__ void signed_distance_watertight_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float* __restrict__ distances, bool use_existing_distances_as_upper_bounds = false);
-__global__ void signed_distance_raystab_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float* __restrict__ distances, bool use_existing_distances_as_upper_bounds = false);
-__global__ void unsigned_distance_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float* __restrict__ distances, bool use_existing_distances_as_upper_bounds = false);
-__global__ void raytrace_kernel(uint32_t n_elements, Vector3f* __restrict__ positions, Vector3f* __restrict__ directions, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles);
+__global__ void signed_distance_watertight_kernel(uint32_t n_elements, const vec3* __restrict__ positions, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float* __restrict__ distances, bool use_existing_distances_as_upper_bounds = false);
+__global__ void signed_distance_raystab_kernel(uint32_t n_elements, const vec3* __restrict__ positions, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float* __restrict__ distances, bool use_existing_distances_as_upper_bounds = false);
+__global__ void unsigned_distance_kernel(uint32_t n_elements, const vec3* __restrict__ positions, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float* __restrict__ distances, bool use_existing_distances_as_upper_bounds = false);
+__global__ void raytrace_kernel(uint32_t n_elements, vec3* __restrict__ positions, vec3* __restrict__ directions, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles);
 
 struct DistAndIdx {
 	float dist;
@@ -235,7 +262,7 @@ __host__ __device__ void sorting_network(T values[N]) {
 template <uint32_t BRANCHING_FACTOR>
 class TriangleBvhWithBranchingFactor : public TriangleBvh {
 public:
-	__host__ __device__ static std::pair<int, float> ray_intersect(const Vector3f& ro, const Vector3f& rd, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles) {
+	__host__ __device__ static std::pair<int, float> ray_intersect(const vec3& ro, const vec3& rd, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles) {
 		FixedIntStack query_stack;
 		query_stack.push(0);
 
@@ -263,7 +290,7 @@ public:
 
 				NGP_PRAGMA_UNROLL
 				for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
-					children[i] = {bvhnodes[i+first_child].bb.ray_intersect(ro, rd).x(), i+first_child};
+					children[i] = {bvhnodes[i+first_child].bb.ray_intersect(ro, rd).x, i+first_child};
 				}
 
 				sorting_network<BRANCHING_FACTOR>(children);
@@ -280,7 +307,7 @@ public:
 		return {shortest_idx, mint};
 	}
 
-	__host__ __device__ static std::pair<int, float> closest_triangle(const Vector3f& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq = MAX_DIST_SQ) {
+	__host__ __device__ static std::pair<int, float> closest_triangle(const vec3& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq) {
 		FixedIntStack query_stack;
 		query_stack.push(0);
 
@@ -332,14 +359,14 @@ public:
 	}
 
 	// Assumes that "point" is a location on a triangle
-	__host__ __device__ static Vector3f avg_normal_around_point(const Vector3f& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles) {
+	__host__ __device__ static vec3 avg_normal_around_point(const vec3& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles) {
 		FixedIntStack query_stack;
 		query_stack.push(0);
 
 		static constexpr float EPSILON = 1e-6f;
 
 		float total_weight = 0;
-		Vector3f result = Vector3f::Zero();
+		vec3 result = vec3(0.0f);
 
 		while (!query_stack.empty()) {
 			int idx = query_stack.pop();
@@ -370,33 +397,33 @@ public:
 		return result / total_weight;
 	}
 
-	__host__ __device__ static float unsigned_distance(const Vector3f& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq = MAX_DIST_SQ) {
+	__host__ __device__ static float unsigned_distance(const vec3& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq) {
 		return closest_triangle(point, bvhnodes, triangles, max_distance_sq).second;
 	}
 
-	__host__ __device__ static float signed_distance_watertight(const Vector3f& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq = MAX_DIST_SQ) {
+	__host__ __device__ static float signed_distance_watertight(const vec3& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq) {
 		auto p = closest_triangle(point, bvhnodes, triangles, max_distance_sq);
 
 		const Triangle& tri = triangles[p.first];
-		Vector3f closest_point = tri.closest_point(point);
-		Vector3f avg_normal = avg_normal_around_point(closest_point, bvhnodes, triangles);
+		vec3 closest_point = tri.closest_point(point);
+		vec3 avg_normal = avg_normal_around_point(closest_point, bvhnodes, triangles);
 
-		return std::copysignf(p.second, avg_normal.dot(point - closest_point));
+		return copysign(p.second, dot(avg_normal, point - closest_point));
 	}
 
-	__host__ __device__ static float signed_distance_raystab(const Vector3f& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq = MAX_DIST_SQ, default_rng_t rng={}) {
+	__host__ __device__ static float signed_distance_raystab(const vec3& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq, default_rng_t rng={}) {
 		float distance = unsigned_distance(point, bvhnodes, triangles, max_distance_sq);
 
-		Vector2f offset = random_val_2d(rng);
+		vec2 offset = random_val_2d(rng);
 
 		static constexpr uint32_t N_STAB_RAYS = 32;
 		for (uint32_t i = 0; i < N_STAB_RAYS; ++i) {
 			// Use a Fibonacci lattice (with random offset) to regularly
 			// distribute the stab rays over the sphere.
-			Vector3f d = fibonacci_dir<N_STAB_RAYS>(i, offset);
+			vec3 d = fibonacci_dir<N_STAB_RAYS>(i, offset);
 
 			// If any of the stab rays goes outside the mesh, the SDF is positive.
-			if (ray_intersect(point, -d, bvhnodes, triangles).first < 0 || ray_intersect(point, d, bvhnodes, triangles).first < 0) {
+			if (ray_intersect(point, d, bvhnodes, triangles).first < 0) {
 				return distance;
 			}
 		}
@@ -405,19 +432,19 @@ public:
 	}
 
 	// Assumes that "point" is a location on a triangle
-	Vector3f avg_normal_around_point(const Vector3f& point, const Triangle* __restrict__ triangles) const {
+	vec3 avg_normal_around_point(const vec3& point, const Triangle* __restrict__ triangles) const {
 		return avg_normal_around_point(point, m_nodes.data(), triangles);
 	}
 
-	float signed_distance(EMeshSdfMode mode, const Vector3f& point, const std::vector<Triangle>& triangles) const {
+	float signed_distance(EMeshSdfMode mode, const vec3& point, const std::vector<Triangle>& triangles) const {
 		if (mode == EMeshSdfMode::Watertight) {
-			return signed_distance_watertight(point, m_nodes.data(), triangles.data());
+			return signed_distance_watertight(point, m_nodes.data(), triangles.data(), MAX_DIST*MAX_DIST);
 		} else {
-			return signed_distance_raystab(point, m_nodes.data(), triangles.data());
+			return signed_distance_raystab(point, m_nodes.data(), triangles.data(), MAX_DIST*MAX_DIST);
 		}
 	}
 
-	void signed_distance_gpu(uint32_t n_elements, EMeshSdfMode mode, const Vector3f* gpu_positions, float* gpu_distances, const Triangle* gpu_triangles, bool use_existing_distances_as_upper_bounds, cudaStream_t stream) override {
+	void signed_distance_gpu(uint32_t n_elements, EMeshSdfMode mode, const vec3* gpu_positions, float* gpu_distances, const Triangle* gpu_triangles, bool use_existing_distances_as_upper_bounds, cudaStream_t stream) override {
 		if (mode == EMeshSdfMode::Watertight) {
 			linear_kernel(signed_distance_watertight_kernel, 0, stream,
 				n_elements,
@@ -463,7 +490,7 @@ public:
 		}
 	}
 
-	void ray_trace_gpu(uint32_t n_elements, Vector3f* gpu_positions, Vector3f* gpu_directions, const Triangle* gpu_triangles, cudaStream_t stream) override {
+	void ray_trace_gpu(uint32_t n_elements, vec3* gpu_positions, vec3* gpu_directions, const Triangle* gpu_triangles, cudaStream_t stream) override {
 #ifdef NGP_OPTIX
 		if (m_optix.available) {
 			m_optix.raytrace->invoke({gpu_positions, gpu_directions, gpu_triangles, m_optix.gas->handle()}, {n_elements, 1, 1}, stream);
@@ -515,7 +542,7 @@ public:
 
 		// Root
 		m_nodes.emplace_back();
-		m_nodes.front().bb = BoundingBox(std::begin(triangles), std::end(triangles));
+		m_nodes.front().bb = BoundingBox(triangles.data(), triangles.data() + triangles.size());
 
 		struct BuildNode {
 			int node_idx;
@@ -543,29 +570,21 @@ public:
 					auto& child = children[i];
 
 					// Choose axis with maximum standard deviation
-					Vector3f mean = Vector3f::Zero();
+					vec3 mean = vec3(0.0f);
 					for (auto it = child.begin; it != child.end; ++it) {
 						mean += it->centroid();
 					}
 					mean /= (float)std::distance(child.begin, child.end);
 
-					Vector3f var = Vector3f::Zero();
+					vec3 var = vec3(0.0f);
 					for (auto it = child.begin; it != child.end; ++it) {
-						Vector3f diff = it->centroid() - mean;
-						var += diff.cwiseProduct(diff);
+						vec3 diff = it->centroid() - mean;
+						var += diff * diff;
 					}
 					var /= (float)std::distance(child.begin, child.end);
 
-					int axis = 0;
-
-					float max = var.maxCoeff();
-					if (var[0] == max) {
-						axis = 0;
-					} else if (var[1] == max) {
-						axis = 1;
-					} else if (var[2] == max) {
-						axis = 2;
-					}
+					float max_val = max(var);
+					int axis = var.x == max_val ? 0 : (var.y == max_val ? 1 : 2);
 
 					auto m = child.begin + std::distance(child.begin, child.end)/2;
 					std::nth_element(child.begin, m, child.end, [&](const Triangle& tri1, const Triangle& tri2) { return tri1.centroid(axis) < tri2.centroid(axis); });
@@ -586,7 +605,7 @@ public:
 				child.node_idx = (int)m_nodes.size();
 
 				m_nodes.emplace_back();
-				m_nodes.back().bb = BoundingBox(child.begin, child.end);
+				m_nodes.back().bb = BoundingBox(&*child.begin, &*child.end);
 
 				if (std::distance(child.begin, child.end) <= n_primitives_per_leaf) {
 					m_nodes.back().left_idx = -(int)std::distance(std::begin(triangles), child.begin)-1;
@@ -605,11 +624,18 @@ public:
 
 	void build_optix(const GPUMemory<Triangle>& triangles, cudaStream_t stream) override {
 #ifdef NGP_OPTIX
-		m_optix.gas = std::make_unique<optix::Gas>(triangles, g_optix, stream);
-		m_optix.raystab = std::make_unique<optix::Program<Raystab>>((const char*)optix_ptx::raystab_ptx, sizeof(optix_ptx::raystab_ptx), g_optix);
-		m_optix.raytrace = std::make_unique<optix::Program<Raytrace>>((const char*)optix_ptx::raytrace_ptx, sizeof(optix_ptx::raytrace_ptx), g_optix);
-		m_optix.pathescape = std::make_unique<optix::Program<PathEscape>>((const char*)optix_ptx::pathescape_ptx, sizeof(optix_ptx::pathescape_ptx), g_optix);
-		m_optix.available = true;
+		m_optix.available = optix::initialize();
+		if (m_optix.available) {
+			m_optix.gas = std::make_unique<optix::Gas>(triangles, g_optix, stream);
+			m_optix.raystab = std::make_unique<optix::Program<Raystab>>((const char*)optix_ptx::raystab_ptx, sizeof(optix_ptx::raystab_ptx), g_optix);
+			m_optix.raytrace = std::make_unique<optix::Program<Raytrace>>((const char*)optix_ptx::raytrace_ptx, sizeof(optix_ptx::raytrace_ptx), g_optix);
+			m_optix.pathescape = std::make_unique<optix::Program<PathEscape>>((const char*)optix_ptx::pathescape_ptx, sizeof(optix_ptx::pathescape_ptx), g_optix);
+			tlog::success() << "Built OptiX GAS and shaders";
+		} else {
+			tlog::warning() << "Falling back to slower TriangleBVH::ray_intersect.";
+		}
+#else //NGP_OPTIX
+		tlog::warning() << "OptiX was not built. Falling back to slower TriangleBVH::ray_intersect.";
 #endif //NGP_OPTIX
 	}
 
@@ -634,7 +660,7 @@ std::unique_ptr<TriangleBvh> TriangleBvh::make() {
 }
 
 __global__ void signed_distance_watertight_kernel(uint32_t n_elements,
-	const Vector3f* __restrict__ positions,
+	const vec3* __restrict__ positions,
 	const TriangleBvhNode* __restrict__ bvhnodes,
 	const Triangle* __restrict__ triangles,
 	float* __restrict__ distances,
@@ -649,7 +675,7 @@ __global__ void signed_distance_watertight_kernel(uint32_t n_elements,
 
 __global__ void signed_distance_raystab_kernel(
 	uint32_t n_elements,
-	const Vector3f* __restrict__ positions,
+	const vec3* __restrict__ positions,
 	const TriangleBvhNode* __restrict__ bvhnodes,
 	const Triangle* __restrict__ triangles,
 	float* __restrict__ distances,
@@ -666,7 +692,7 @@ __global__ void signed_distance_raystab_kernel(
 }
 
 __global__ void unsigned_distance_kernel(uint32_t n_elements,
-	const Vector3f* __restrict__ positions,
+	const vec3* __restrict__ positions,
 	const TriangleBvhNode* __restrict__ bvhnodes,
 	const Triangle* __restrict__ triangles,
 	float* __restrict__ distances,
@@ -679,7 +705,7 @@ __global__ void unsigned_distance_kernel(uint32_t n_elements,
 	distances[i] = TriangleBvh4::unsigned_distance(positions[i], bvhnodes, triangles, max_distance*max_distance);
 }
 
-__global__ void raytrace_kernel(uint32_t n_elements, Vector3f* __restrict__ positions, Vector3f* __restrict__ directions, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles) {
+__global__ void raytrace_kernel(uint32_t n_elements, vec3* __restrict__ positions, vec3* __restrict__ directions, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n_elements) return;
 
@@ -694,26 +720,6 @@ __global__ void raytrace_kernel(uint32_t n_elements, Vector3f* __restrict__ posi
 	}
 }
 
-void init_optix() {
-	// Initialize CUDA with a no-op call to the the CUDA runtime API
-	CUDA_CHECK_THROW(cudaFree(nullptr));
-
-#ifdef NGP_OPTIX
-	// Initialize the OptiX API, loading all API entry points
-	OPTIX_CHECK_THROW(optixInit());
-
-	// Specify options for this context. We will use the default options.
-	OptixDeviceContextOptions options = {};
-
-	// Associate a CUDA context (and therefore a specific GPU) with this
-	// device context
-	CUcontext cuCtx = 0; // NULL means take the current active context
-
-	OPTIX_CHECK_THROW(optixDeviceContextCreate(cuCtx, &options, &g_optix));
-#endif //NGP_OPTIX
 }
-
-
-NGP_NAMESPACE_END
 
 

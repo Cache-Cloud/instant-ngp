@@ -12,9 +12,11 @@
  *  @author Thomas Müller, NVIDIA
  */
 
- #pragma once
+#pragma once
 
-NGP_NAMESPACE_BEGIN
+#include <vector>
+
+namespace ngp {
 
 struct DiscreteDistribution {
 	void build(std::vector<float> weights) {
@@ -43,4 +45,4 @@ struct DiscreteDistribution {
 	std::vector<float> cdf;
 };
 
-NGP_NAMESPACE_END
+}

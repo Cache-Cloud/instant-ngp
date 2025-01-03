@@ -11,9 +11,10 @@
 /** @file   program.h
  *  @author Thomas Müller, NVIDIA
  */
+
 #pragma once
 
-NGP_NAMESPACE_BEGIN
+namespace ngp {
 
 #define OPTIX_CHECK_THROW(x)                                                                                 \
 	do {                                                                                                     \
@@ -32,7 +33,6 @@ NGP_NAMESPACE_BEGIN
 			throw std::runtime_error(std::string("Optix call '" #x "' failed. Log:\n") + log + (sizeof_log_returned == sizeof_log ? "" : "<truncated>")); \
 		}                                                                                                                                                 \
 	} while(0)
-
 
 namespace optix {
 	template <typename T>
@@ -235,4 +235,4 @@ namespace optix {
 	};
 }
 
-NGP_NAMESPACE_END
+}

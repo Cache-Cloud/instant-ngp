@@ -13,15 +13,13 @@
  *  @brief  Minimal optix program.
  */
 
+#include <neural-graphics-primitives/common_device.cuh>
+
 #include <optix.h>
 
 #include "raytrace.h"
-#include <neural-graphics-primitives/common_device.cuh>
 
-using namespace Eigen;
-
-
-NGP_NAMESPACE_BEGIN
+namespace ngp {
 
 extern "C" {
 	__constant__ Raytrace::Params params;
@@ -31,8 +29,8 @@ extern "C" __global__ void __raygen__rg() {
 	const uint3 idx = optixGetLaunchIndex();
 	const uint3 dim = optixGetLaunchDimensions();
 
-	Vector3f ray_origin = params.ray_origins[idx.x];
-	Vector3f ray_direction = params.ray_directions[idx.x];
+	vec3 ray_origin = params.ray_origins[idx.x];
+	vec3 ray_direction = params.ray_directions[idx.x];
 
 	unsigned int p0, p1;
 	optixTrace(
@@ -73,4 +71,4 @@ extern "C" __global__ void __closesthit__ch() {
 	optixSetPayload_1(__float_as_int(optixGetRayTmax()));
 }
 
-NGP_NAMESPACE_END
+}

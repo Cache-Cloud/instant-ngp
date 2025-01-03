@@ -12,7 +12,6 @@ import os
 
 from common import *
 
-
 def ours_real_converted(path, frameidx):
 	return {
 		"data_dir"      : os.path.join(NERF_DATA_FOLDER, path),
@@ -40,6 +39,15 @@ def nerf_real_360(name, frameidx):
 		"dataset"       : "",
 		"frameidx"      : frameidx
 	}
+
+def mipnerf_360(name, frameidx):
+	return {
+		"data_dir"      : os.path.join(NERF_DATA_FOLDER, f"mipnerf_360/{name}"),
+		"dataset_train" : "transforms.json",
+		"dataset_test"  : "transforms.json",
+		"dataset"       : "",
+		"frameidx"      : frameidx
+	}
 scenes_nerf = {
 	"fox"         : ours_real_converted("fox/", frameidx=0),
 	"lego"      : nerf_synthetic("lego", frameidx=52),
@@ -54,8 +62,16 @@ scenes_nerf = {
 	# nerf real 360
 	"pinecone" : nerf_real_360("pinecone", frameidx=0),
 	"vasedeck" : nerf_real_360("vasedeck", frameidx=0),
-}
 
+	# mipnerf 360
+	"bicycle" : mipnerf_360("bicycle", frameidx=0),
+	"bonsai"  : mipnerf_360("bonsai", frameidx=0),
+	"counter" : mipnerf_360("counter", frameidx=0),
+	"garden"  : mipnerf_360("garden", frameidx=0),
+	"kitchen" : mipnerf_360("kitchen", frameidx=0),
+	"room"    : mipnerf_360("room", frameidx=0),
+	"stump"   : mipnerf_360("stump", frameidx=0),
+}
 
 def ours_mesh(name, up = [0,1,0], infolder=True):
 	return {
@@ -68,8 +84,7 @@ scenes_sdf = {
 	"armadillo"     : ours_mesh("armadillo", infolder=False),
 }
 
-
-def ours_image(name,infolder=True):
+def ours_image(name, infolder=True):
 	data_dir = os.path.join(IMAGE_DATA_FOLDER, f"{name}") if infolder else IMAGE_DATA_FOLDER
 	dataset = f"{name}.bin"
 	if not os.path.exists(os.path.join(data_dir, dataset)):
@@ -87,6 +102,7 @@ def ours_image(name,infolder=True):
 scenes_image = {
 	"albert"        : ours_image("albert", False),
 }
+
 
 def ours_volume(name, ds):
 	return {
@@ -106,7 +122,7 @@ def setup_colored_sdf(testbed, scene, softshadow=True):
 		testbed.view_dir=[-0.366,-0.314,-0.876]
 		testbed.look_at=[0.587,0.420,0.479]
 		testbed.scale=0.887
-		testbed.fov,testbed.dof,testbed.slice_plane_z=39.600,0.000,0.655
+		testbed.fov,testbed.aperture_size,testbed.slice_plane_z=39.600,0.000,0.655
 
 		testbed.sdf.brdf.metallic=0.000
 		testbed.sdf.brdf.subsurface=0.000
@@ -124,7 +140,7 @@ def setup_colored_sdf(testbed, scene, softshadow=True):
 		testbed.up_dir=[0.000,1.000,0.000]
 		testbed.view_dir=[0.997,-0.059,-0.057]
 		testbed.look_at=[0.500,0.500,0.500]
-		testbed.fov,testbed.dof,testbed.slice_plane_z=40.700,0.000,0.557
+		testbed.fov,testbed.aperture_size,testbed.slice_plane_z=40.700,0.000,0.557
 		testbed.scale=0.976
 
 		testbed.sdf.brdf.metallic=0.000
@@ -144,7 +160,7 @@ def setup_colored_sdf(testbed, scene, softshadow=True):
 		testbed.view_dir=[-0.639,-0.720,0.272]
 		testbed.look_at=[0.540,0.451,0.457]
 		testbed.scale=1.074
-		testbed.fov,testbed.dof,testbed.slice_plane_z=39.600,0.000,0.025
+		testbed.fov,testbed.aperture_size,testbed.slice_plane_z=39.600,0.000,0.025
 
 		testbed.sdf.brdf.metallic=1.000
 		testbed.sdf.brdf.subsurface=0.000
@@ -162,7 +178,7 @@ def setup_colored_sdf(testbed, scene, softshadow=True):
 		testbed.up_dir=[0.000,0.000,1.000]
 		testbed.view_dir=[0.003,-0.960,-0.281]
 		testbed.scale=1.299
-		testbed.fov,testbed.dof,testbed.slice_plane_z=39.600,0.000,0.768
+		testbed.fov,testbed.aperture_size,testbed.slice_plane_z=39.600,0.000,0.768
 
 		testbed.sdf.brdf.metallic=0.000
 		testbed.sdf.brdf.subsurface=0.000
@@ -179,7 +195,7 @@ def setup_colored_sdf(testbed, scene, softshadow=True):
 			testbed.up_dir=[0.000,-1.000,-0.000]
 			testbed.view_dir=[-0.924,0.128,-0.361]
 			testbed.look_at=[0.500,0.500,0.500]
-			testbed.fov,testbed.dof,testbed.slice_plane_z=39.600,0.000,0.377
+			testbed.fov,testbed.aperture_size,testbed.slice_plane_z=39.600,0.000,0.377
 
 		testbed.background_color = [0.580, 0.713, 0.882, 1.000]
 		testbed.exposure = 1.000
@@ -203,3 +219,10 @@ def setup_colored_sdf(testbed, scene, softshadow=True):
 	col = list(testbed.background_color)
 	testbed.sdf.brdf.ambientcolor = np.multiply(col,col)[0:3]
 	testbed.sdf.shadow_sharpness = 16 if softshadow else 2048
+	testbed.scale = testbed.scale * 1.13
+
+def default_snapshot_filename(scene_info):
+	filename = f"base.ingp"
+	if scene_info["dataset"]:
+		filename = f"{os.path.splitext(scene_info['dataset'])[0]}_{filename}"
+	return os.path.join(scene_info["data_dir"], filename)

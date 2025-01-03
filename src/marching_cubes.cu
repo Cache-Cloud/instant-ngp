@@ -12,15 +12,15 @@
  *  @author Alex Evans, NVIDIA
  */
 
-#include <neural-graphics-primitives/common.h>
-#include <neural-graphics-primitives/common_device.cuh>
 #include <neural-graphics-primitives/bounding_box.cuh>
+#include <neural-graphics-primitives/common_device.cuh>
+#include <neural-graphics-primitives/common_host.h>
 #include <neural-graphics-primitives/random_val.cuh> // helpers to generate random values, directions
+#include <neural-graphics-primitives/thread_pool.h>
 
 #include <tiny-cuda-nn/gpu_memory.h>
+#include <filesystem/path.h>
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include <stb_image/stb_image_write.h>
 #include <stdarg.h>
 
 #ifdef NGP_GUI
@@ -35,93 +35,130 @@
 
 #include <vector>
 
-using namespace Eigen;
-using namespace tcnn;
+namespace ngp {
 
-
-NGP_NAMESPACE_BEGIN
+ivec3 get_marching_cubes_res(uint32_t res_1d, const BoundingBox &aabb) {
+	float scale = res_1d / max(aabb.max - aabb.min);
+	ivec3 res3d = (aabb.max - aabb.min) * scale + 0.5f;
+	res3d.x = next_multiple((unsigned int)res3d.x, 16u);
+	res3d.y = next_multiple((unsigned int)res3d.y, 16u);
+	res3d.z = next_multiple((unsigned int)res3d.z, 16u);
+	return res3d;
+}
 
 #ifdef NGP_GUI
-static bool check_shader(GLuint handle, const char* desc, bool program) {
+void glCheckError(const char* file, unsigned int line) {
+	GLenum errorCode = glGetError();
+	while (errorCode != GL_NO_ERROR) {
+		std::string fileString(file);
+		std::string error = "unknown error";
+		// clang-format off
+		switch (errorCode) {
+			case GL_INVALID_ENUM:      error = "GL_INVALID_ENUM"; break;
+			case GL_INVALID_VALUE:     error = "GL_INVALID_VALUE"; break;
+			case GL_INVALID_OPERATION: error = "GL_INVALID_OPERATION"; break;
+			case GL_STACK_OVERFLOW:    error = "GL_STACK_OVERFLOW"; break;
+			case GL_STACK_UNDERFLOW:   error = "GL_STACK_UNDERFLOW"; break;
+			case GL_OUT_OF_MEMORY:     error = "GL_OUT_OF_MEMORY"; break;
+		}
+		// clang-format on
+
+		tlog::error() << "OpenglError : file=" << file << " line=" << line << " error:" << error;
+		errorCode = glGetError();
+	}
+}
+
+bool check_shader(uint32_t handle, const char* desc, bool program) {
 	GLint status = 0, log_length = 0;
 	if (program) {
 		glGetProgramiv(handle, GL_LINK_STATUS, &status);
 		glGetProgramiv(handle, GL_INFO_LOG_LENGTH, &log_length);
-	}
-	else {
+	} else {
 		glGetShaderiv(handle, GL_COMPILE_STATUS, &status);
 		glGetShaderiv(handle, GL_INFO_LOG_LENGTH, &log_length);
 	}
-	if ((GLboolean)status == GL_FALSE)
-		fprintf(stderr, "failed to compile %s!\n", desc);
-	if (log_length > 1)
-	{
+	if ((GLboolean)status == GL_FALSE) {
+		tlog::error() << "Failed to compile shader: " << desc;
+	}
+	if (log_length > 1) {
 		std::vector<char> log; log.resize(log_length+1);
-		if (program)
+		if (program) {
 			glGetProgramInfoLog(handle, log_length, NULL, (GLchar*)log.data());
-		else
+		} else {
 			glGetShaderInfoLog(handle, log_length, NULL, (GLchar*)log.data());
+		}
 		log.back() = 0;
-		fprintf(stderr, "%s\n", log.data());
+		tlog::error() << log.data();
 	}
 	return (GLboolean)status == GL_TRUE;
 }
 
-static GLuint compile_shader(bool pixel, const char* code) {
+uint32_t compile_shader(bool pixel, const char* code) {
 	GLuint g_VertHandle = glCreateShader(pixel ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER );
-	const char* glsl_version = "#version 450 core";
+	const char* glsl_version = "#version 140\n";
 	const GLchar* strings[2] = { glsl_version, code};
 	glShaderSource(g_VertHandle, 2, strings, NULL);
 	glCompileShader(g_VertHandle);
-	if (!check_shader(g_VertHandle, pixel?"pixel":"vertex", false)) {
+	if (!check_shader(g_VertHandle, pixel? "pixel" : "vertex", false)) {
 		glDeleteShader(g_VertHandle);
 		return 0;
 	}
 	return g_VertHandle;
 }
 
-void draw_mesh_gl(const GPUMemory<Eigen::Vector3f> &verts, const GPUMemory<Eigen::Vector3f> &normals, const GPUMemory<Eigen::Vector3f> &colors,const GPUMemory<uint32_t> &indices, Eigen::Vector2i resolution,	Eigen::Vector2f focal_length, Eigen::Matrix<float, 3, 4> camera_matrix,	Eigen::Vector2f screen_center, int mesh_render_mode) {
-	// my god the horror
-	if (verts.size()==0 || indices.size()==0 || mesh_render_mode==0)
+void draw_mesh_gl(
+	const GPUMemory<vec3>& verts,
+	const GPUMemory<vec3>& normals,
+	const GPUMemory<vec3>& colors,
+	const GPUMemory<uint32_t>& indices,
+	const ivec2& resolution,
+	const vec2& focal_length,
+	const mat4x3& camera_matrix,
+	const vec2& screen_center,
+	int mesh_render_mode
+) {
+	if (verts.size() == 0 || indices.size() == 0 || mesh_render_mode == 0) {
 		return;
-	static GLuint vs = 0, ps = 0, program = 0, VAO=0, VBO[3]={}, els=0, vbosize=0, elssize=0;
+	}
+
+	static GLuint vs = 0, ps = 0, program = 0, VAO = 0, VBO[3] = {}, els = 0, vbosize = 0, elssize = 0;
 	if (!VAO) {
 		glGenVertexArrays(1, &VAO);
 		glBindVertexArray(VAO);
 	}
-	if (vbosize!=verts.size()) {
-		for (int i=0;i<3;++i) {
+	if (vbosize != verts.size()) {
+		for (int i= 0; i < 3; ++i) {
 			if (VBO[i]) {
-				cudaGLUnregisterBufferObject( VBO[i] );
+				cudaGLUnregisterBufferObject(VBO[i]);
 				glDeleteBuffers(1, &VBO[i]);
 			}
 			glGenBuffers(1, &VBO[i]);
-			vbosize=verts.size();
-			glBindBuffer( GL_ARRAY_BUFFER, VBO[i]);
-			glBufferData( GL_ARRAY_BUFFER, vbosize * sizeof(Eigen::Vector3f), NULL, GL_DYNAMIC_COPY );
-			cudaGLRegisterBufferObject( VBO[i] );
+			vbosize = verts.size();
+			glBindBuffer(GL_ARRAY_BUFFER, VBO[i]);
+			glBufferData(GL_ARRAY_BUFFER, vbosize * sizeof(vec3), NULL, GL_DYNAMIC_COPY);
+			cudaGLRegisterBufferObject(VBO[i]);
 		}
 	}
-	if (elssize!=indices.size()) {
+	if (elssize != indices.size()) {
 		if (els) {
-			cudaGLUnregisterBufferObject( els );
+			cudaGLUnregisterBufferObject(els);
 			glDeleteBuffers(1, &els);
 		}
 		glGenBuffers(1, &els);
-		elssize=indices.size();
+		elssize = indices.size();
 		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, els);
 		glBufferData(GL_ELEMENT_ARRAY_BUFFER, elssize * sizeof(int), NULL, GL_STREAM_DRAW);
-		cudaGLRegisterBufferObject( els );
+		cudaGLRegisterBufferObject(els);
 	}
 	void *ptr=nullptr;
 	cudaGLMapBufferObject(&ptr, VBO[0]);
-	if (ptr) cudaMemcpy(ptr, verts.data(), vbosize * sizeof(Eigen::Vector3f), cudaMemcpyDeviceToDevice);
+	if (ptr) cudaMemcpy(ptr, verts.data(), vbosize * sizeof(vec3), cudaMemcpyDeviceToDevice);
 	cudaGLMapBufferObject(&ptr, VBO[1]);
-	if (ptr) cudaMemcpy(ptr, normals.data(), vbosize * sizeof(Eigen::Vector3f), cudaMemcpyDeviceToDevice);
+	if (ptr) cudaMemcpy(ptr, normals.data(), vbosize * sizeof(vec3), cudaMemcpyDeviceToDevice);
 	cudaGLMapBufferObject(&ptr, VBO[2]);
-	if (ptr) cudaMemcpy(ptr, colors.data(), vbosize * sizeof(Eigen::Vector3f), cudaMemcpyDeviceToDevice);
+	if (ptr) cudaMemcpy(ptr, colors.data(), vbosize * sizeof(vec3), cudaMemcpyDeviceToDevice);
 
-	//std::vector<Eigen::Vector3f> cpucols; cpucols.resize(verts.size());
+	//std::vector<vec3> cpucols; cpucols.resize(verts.size());
 	//colors.copy_to_host(cpucols);
 
 	cudaGLUnmapBufferObject(VBO[2]);
@@ -132,10 +169,10 @@ void draw_mesh_gl(const GPUMemory<Eigen::Vector3f> &verts, const GPUMemory<Eigen
 	cudaGLUnmapBufferObject(els);
 
 	if (!program) {
-		vs = compile_shader(false,R"foo(
-layout (location = 0) in vec3 pos;
-layout (location = 1) in vec3 nor;
-layout (location = 2) in vec3 col;
+		vs = compile_shader(false, R"foo(
+in vec3 pos;
+in vec3 nor;
+in vec3 col;
 out vec3 vtxcol;
 uniform mat4 camera;
 uniform vec2 f;
@@ -144,34 +181,25 @@ uniform vec2 cen;
 uniform int mode;
 void main()
 {
-	vec4 p = camera * vec4(pos,1.) ;
-	p.xy*=vec2(2.,-2.)*f.xy/vec2(res.xy);
-	p.w=p.z;
-	p.z=p.z-0.1;
-	if (mode==2)
-		vtxcol= normalize(nor)*0.5+vec3(0.5); // visualize vertex normals
-	else
-		vtxcol= col;
+	vec4 p = camera * vec4(pos, 1.0);
+	p.xy *= vec2(2.0, -2.0) * f.xy / vec2(res.xy);
+	p.w = p.z;
+	p.z = p.z - 0.1;
+	p.xy += cen * p.w;
+	if (mode == 2) {
+		vtxcol = normalize(nor) * 0.5 + vec3(0.5); // visualize vertex normals
+	} else {
+		vtxcol = col;
+	}
 	gl_Position = p;
 }
 )foo");
-		ps = compile_shader(true,R"foo(
-#extension GL_NV_fragment_shader_barycentric : enable
-layout (location = 0) out vec4 o;
+		ps = compile_shader(true, R"foo(
+out vec4 o;
 in vec3 vtxcol;
 uniform int mode;
 void main() {
-	if (mode==3) {
-		vec3 tricol=vec3((ivec3(923,3572,5423)*gl_PrimitiveID)&255)*(1./255.);
-		o=vec4(tricol,1.0);
-	} else {
-		o=vec4(vtxcol,1.0);
-	}
-	float aa, edge;
-	aa=fwidth(gl_BaryCoordNV.x); edge = smoothstep(0.f,aa, gl_BaryCoordNV.x);
-	aa=fwidth(gl_BaryCoordNV.y); edge = min(edge, smoothstep(0.f,aa, gl_BaryCoordNV.y));
-	aa=fwidth(gl_BaryCoordNV.z); edge = min(edge, smoothstep(0.f,aa, gl_BaryCoordNV.z));
-	o.xyz*=sqrt(edge);
+	o = vec4(vtxcol, 1.0);
 }
 )foo");
 		program = glCreateProgram();
@@ -183,31 +211,30 @@ void main() {
 			program = 0;
 		}
 	}
-	Eigen::Matrix4f view2world=Eigen::Matrix4f::Identity();
-	view2world.block<3,4>(0,0) = camera_matrix;
-	Eigen::Matrix4f world2view = view2world.inverse();
+	mat4 view2world = camera_matrix;
+	mat4 world2view = inverse(view2world);
 	glBindVertexArray(VAO);
 	glUseProgram(program);
 	glUniformMatrix4fv(glGetUniformLocation(program, "camera"), 1, GL_FALSE, (GLfloat*)&world2view);
-	glUniform2f(glGetUniformLocation(program, "f"), focal_length.x(),focal_length.y());
-	glUniform2f(glGetUniformLocation(program, "cen"), screen_center.x(),screen_center.y());
-	glUniform2i(glGetUniformLocation(program, "res"), resolution.x(),resolution.y());
+	glUniform2f(glGetUniformLocation(program, "f"), focal_length.x, focal_length.y);
+	glUniform2f(glGetUniformLocation(program, "cen"), screen_center.x*2.f-1.f, screen_center.y*-2.f+1.f);
+	glUniform2i(glGetUniformLocation(program, "res"), resolution.x, resolution.y);
 	glUniform1i(glGetUniformLocation(program, "mode"), mesh_render_mode);
 	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, els);
-    GLuint posat = (GLuint)glGetAttribLocation(program, "pos");
+	GLuint posat = (GLuint)glGetAttribLocation(program, "pos");
 	GLuint norat = (GLuint)glGetAttribLocation(program, "nor");
 	GLuint colat = (GLuint)glGetAttribLocation(program, "col");
-    glEnableVertexAttribArray(posat);
+	glEnableVertexAttribArray(posat);
 	glEnableVertexAttribArray(norat);
 	glEnableVertexAttribArray(colat);
-    glBindBuffer(GL_ARRAY_BUFFER, VBO[0]);
-    glVertexAttribPointer(posat, 3, GL_FLOAT, GL_FALSE, 3*4, 0);
+	glBindBuffer(GL_ARRAY_BUFFER, VBO[0]);
+	glVertexAttribPointer(posat, 3, GL_FLOAT, GL_FALSE, 3*4, 0);
 	glBindBuffer(GL_ARRAY_BUFFER, VBO[1]);
-    glVertexAttribPointer(norat, 3, GL_FLOAT, GL_FALSE, 3*4, 0);
+	glVertexAttribPointer(norat, 3, GL_FLOAT, GL_FALSE, 3*4, 0);
 	glBindBuffer(GL_ARRAY_BUFFER, VBO[2]);
-    glVertexAttribPointer(colat, 3, GL_FLOAT, GL_FALSE, 3*4, 0);
-    glCullFace(GL_BACK);
-    glDisable(GL_CULL_FACE);
+	glVertexAttribPointer(colat, 3, GL_FLOAT, GL_FALSE, 3*4, 0);
+	glCullFace(GL_BACK);
+	glDisable(GL_CULL_FACE);
 	glEnable(GL_DEPTH_TEST);
 	glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT , (GLvoid*)0);
 	glDisable(GL_CULL_FACE);
@@ -231,19 +258,19 @@ with z=1
 
 edges 8-11 go in +z direction from vertex 0-3
 */
-__global__ void gen_vertices(BoundingBox aabb, Eigen::Vector3i res_3d, const float* __restrict__ density, int*__restrict__ vertidx_grid, Eigen::Vector3f* verts_out, float thresh, uint32_t *__restrict__ counters) {
+__global__ void gen_vertices(BoundingBox render_aabb, mat3 render_aabb_to_local, ivec3 res_3d, const float* __restrict__ density, int*__restrict__ vertidx_grid, vec3* verts_out, float thresh, uint32_t* __restrict__ counters) {
 	uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
 	uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
 	uint32_t z = blockIdx.z * blockDim.z + threadIdx.z;
-	if (x>=res_3d.x() || y>=res_3d.y() || z>=res_3d.z()) return;
-	Eigen::Vector3f scale=(aabb.max-aabb.min).cwiseQuotient(res_3d.cast<float>());
-	Eigen::Vector3f offset=aabb.min;
-	uint32_t res2=res_3d.x()*res_3d.y();
-	uint32_t res3=res_3d.x()*res_3d.y()*res_3d.z();
-	uint32_t idx=x+y*res_3d.x()+z*res2;
+	if (x>=res_3d.x || y>=res_3d.y || z>=res_3d.z) return;
+	vec3 scale = (render_aabb.max - render_aabb.min) / vec3(res_3d - 1);
+	vec3 offset=render_aabb.min;
+	uint32_t res2=res_3d.x*res_3d.y;
+	uint32_t res3=res_3d.x*res_3d.y*res_3d.z;
+	uint32_t idx=x+y*res_3d.x+z*res2;
 	float f0 = density[idx];
 	bool inside=(f0>thresh);
-	if (x<res_3d.x()-1) {
+	if (x<res_3d.x-1) {
 		float f1 = density[idx+1];
 		if (inside != (f1>thresh)) {
 			uint32_t vidx = atomicAdd(counters,1);
@@ -251,23 +278,23 @@ __global__ void gen_vertices(BoundingBox aabb, Eigen::Vector3i res_3d, const flo
 				vertidx_grid[idx]=vidx+1;
 				float prevf=f0,nextf=f1;
 				float dt=((thresh-prevf)/(nextf-prevf));
-				verts_out[vidx]=Eigen::Vector3f{float(x)+dt, float(y), float(z)}.cwiseProduct(scale) + offset;
+				verts_out[vidx] = transpose(render_aabb_to_local) * (vec3{float(x)+dt, float(y), float(z)} * scale + offset);
 			}
 		}
 	}
-	if (y<res_3d.y()-1) {
-		float f1 = density[idx+res_3d.x()];
+	if (y<res_3d.y-1) {
+		float f1 = density[idx+res_3d.x];
 		if (inside != (f1>thresh)) {
 			uint32_t vidx = atomicAdd(counters,1);
 			if (verts_out) {
 				vertidx_grid[idx+res3]=vidx+1;
 				float prevf=f0,nextf=f1;
 				float dt=((thresh-prevf)/(nextf-prevf));
-				verts_out[vidx]=Eigen::Vector3f{float(x), float(y)+dt, float(z)}.cwiseProduct(scale) + offset;
+				verts_out[vidx] = transpose(render_aabb_to_local) * (vec3{float(x), float(y)+dt, float(z)} * scale + offset);
 			}
 		}
 	}
-	if (z<res_3d.z()-1) {
+	if (z<res_3d.z-1) {
 		float f1 = density[idx+res2];
 		if (inside != (f1>thresh)) {
 			uint32_t vidx = atomicAdd(counters,1);
@@ -275,59 +302,59 @@ __global__ void gen_vertices(BoundingBox aabb, Eigen::Vector3i res_3d, const flo
 				vertidx_grid[idx+res3*2]=vidx+1;
 				float prevf=f0,nextf=f1;
 				float dt=((thresh-prevf)/(nextf-prevf));
-				verts_out[vidx]=Eigen::Vector3f{float(x), float(y), float(z)+dt}.cwiseProduct(scale) + offset;
+				verts_out[vidx] = transpose(render_aabb_to_local) * (vec3{float(x), float(y), float(z)+dt} * scale + offset);
 			}
 		}
 	}
 }
 
-__global__ void accumulate_1ring(uint32_t num_tris, const uint32_t* indices, const Eigen::Vector3f* verts_in, Eigen::Vector4f* verts_out, Eigen::Vector3f *normals_out) {
+__global__ void accumulate_1ring(uint32_t num_tris, const uint32_t* indices, const vec3* verts_in, vec4* verts_out, vec3 *normals_out) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i>=num_tris) return;
 	uint32_t ia=indices[i*3+0];
 	uint32_t ib=indices[i*3+1];
 	uint32_t ic=indices[i*3+2];
-	Eigen::Vector3f pa=verts_in[ia];
-	Eigen::Vector3f pb=verts_in[ib];
-	Eigen::Vector3f pc=verts_in[ic];
+	vec3 pa=verts_in[ia];
+	vec3 pb=verts_in[ib];
+	vec3 pc=verts_in[ic];
 
-	atomicAdd(&verts_out[ia][0], pb.x()+pc.x());
-	atomicAdd(&verts_out[ia][1], pb.y()+pc.y());
-	atomicAdd(&verts_out[ia][2], pb.z()+pc.z());
+	atomicAdd(&verts_out[ia][0], pb.x+pc.x);
+	atomicAdd(&verts_out[ia][1], pb.y+pc.y);
+	atomicAdd(&verts_out[ia][2], pb.z+pc.z);
 	atomicAdd(&verts_out[ia][3], 2.f);
-	atomicAdd(&verts_out[ib][0], pa.x()+pc.x());
-	atomicAdd(&verts_out[ib][1], pa.y()+pc.y());
-	atomicAdd(&verts_out[ib][2], pa.z()+pc.z());
+	atomicAdd(&verts_out[ib][0], pa.x+pc.x);
+	atomicAdd(&verts_out[ib][1], pa.y+pc.y);
+	atomicAdd(&verts_out[ib][2], pa.z+pc.z);
 	atomicAdd(&verts_out[ib][3], 2.f);
-	atomicAdd(&verts_out[ic][0], pb.x()+pa.x());
-	atomicAdd(&verts_out[ic][1], pb.y()+pa.y());
-	atomicAdd(&verts_out[ic][2], pb.z()+pa.z());
+	atomicAdd(&verts_out[ic][0], pb.x+pa.x);
+	atomicAdd(&verts_out[ic][1], pb.y+pa.y);
+	atomicAdd(&verts_out[ic][2], pb.z+pa.z);
 	atomicAdd(&verts_out[ic][3], 2.f);
 
 	if (normals_out) {
-		Eigen::Vector3f n= (pb-pa).cross(pa-pc); // don't normalise so it's weighted by area
-		atomicAdd(&normals_out[ia][0], n.x());
-		atomicAdd(&normals_out[ia][1], n.y());
-		atomicAdd(&normals_out[ia][2], n.z());
-		atomicAdd(&normals_out[ib][0], n.x());
-		atomicAdd(&normals_out[ib][1], n.y());
-		atomicAdd(&normals_out[ib][2], n.z());
-		atomicAdd(&normals_out[ic][0], n.x());
-		atomicAdd(&normals_out[ic][1], n.y());
-		atomicAdd(&normals_out[ic][2], n.z());
+		vec3 n= cross(pb - pa, pa - pc); // don't normalise so it's weighted by area
+		atomicAdd(&normals_out[ia][0], n.x);
+		atomicAdd(&normals_out[ia][1], n.y);
+		atomicAdd(&normals_out[ia][2], n.z);
+		atomicAdd(&normals_out[ib][0], n.x);
+		atomicAdd(&normals_out[ib][1], n.y);
+		atomicAdd(&normals_out[ib][2], n.z);
+		atomicAdd(&normals_out[ic][0], n.x);
+		atomicAdd(&normals_out[ic][1], n.y);
+		atomicAdd(&normals_out[ic][2], n.z);
 	}
 }
 
-__global__ void compute_centroids(uint32_t num_verts, Eigen::Vector3f* centroids_out, const Eigen::Vector4f* verts_in) {
+__global__ void compute_centroids(uint32_t num_verts, vec3* centroids_out, const vec4* verts_in) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i>=num_verts) return;
-	Eigen::Vector4f p = verts_in[i];
-	if (p.w()<=0.f) return;
-	Eigen::Vector3f c=verts_in[i].head<3>() * (1.f/p.w());
+	vec4 p = verts_in[i];
+	if (p.w<=0.f) return;
+	vec3 c = verts_in[i].xyz() * (1.f / p.w);
 	centroids_out[i]=c;
 }
 
-__global__ void gen_faces(Eigen::Vector3i res_3d, const float* __restrict__ density, const int*__restrict__ vertidx_grid, uint32_t* indices_out, float thresh, uint32_t *__restrict__ counters) {
+__global__ void gen_faces(ivec3 res_3d, const float* __restrict__ density, const int*__restrict__ vertidx_grid, uint32_t* indices_out, float thresh, uint32_t *__restrict__ counters) {
 	// marching cubes tables from https://github.com/pmneila/PyMCubes/blob/master/mcubes/src/marchingcubes.cpp which in turn seems to be from https://web.archive.org/web/20181127124338/http://paulbourke.net/geometry/polygonise/
 	// License is BSD 3-clause, which can be found here: https://github.com/pmneila/PyMCubes/blob/master/LICENSE
 	/*
@@ -614,11 +641,11 @@ __global__ void gen_faces(Eigen::Vector3i res_3d, const float* __restrict__ dens
 	uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
 	uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
 	uint32_t z = blockIdx.z * blockDim.z + threadIdx.z;
-	if (x>=res_3d.x()-1 || y>=res_3d.y()-1 || z>=res_3d.z()-1) return;
-	uint32_t res1=res_3d.x();
-	uint32_t res2=res_3d.x()*res_3d.y();
-	uint32_t res3=res_3d.x()*res_3d.y()*res_3d.z();
-	uint32_t idx=x+y*res_3d.x()+z*res2;
+	if (x>=res_3d.x-1 || y>=res_3d.y-1 || z>=res_3d.z-1) return;
+	uint32_t res1=res_3d.x;
+	uint32_t res2=res_3d.x*res_3d.y;
+	uint32_t res3=res_3d.x*res_3d.y*res_3d.z;
+	uint32_t idx=x+y*res_3d.x+z*res2;
 
 	uint32_t idx_x=idx;
 	uint32_t idx_y=idx+res3;
@@ -663,14 +690,14 @@ __global__ void gen_faces(Eigen::Vector3i res_3d, const float* __restrict__ dens
 			int j = triangles[i];
 			if (j<0) break;
 			if (!local_edges[j]) {
-				printf("WAT - at %d %d %d, mask is %d, j is %d, local_edges is 0\n", x,y,z,mask,j);
+				printf("at %d %d %d, mask is %d, j is %d, local_edges is 0\n", x,y,z,mask,j);
 			}
 			indices_out[tidx+i]=local_edges[j]-1;
 		}
 	}
 }
 
-void compute_mesh_1ring(const tcnn::GPUMemory<Eigen::Vector3f> &verts, const tcnn::GPUMemory<uint32_t> &indices, tcnn::GPUMemory<Eigen::Vector4f> &output_pos, tcnn::GPUMemory<Eigen::Vector3f> &output_normals) { // computes the average of the 1ring of all verts, as homogenous coordinates
+void compute_mesh_1ring(const GPUMemory<vec3> &verts, const GPUMemory<uint32_t> &indices, GPUMemory<vec4> &output_pos, GPUMemory<vec3> &output_normals) { // computes the average of the 1ring of all verts, as homogenous coordinates
 	output_pos.resize(verts.size());
 	output_pos.memset(0);
 	output_normals.resize(verts.size());
@@ -678,38 +705,52 @@ void compute_mesh_1ring(const tcnn::GPUMemory<Eigen::Vector3f> &verts, const tcn
 	linear_kernel(accumulate_1ring, 0, nullptr, indices.size()/3, indices.data(), verts.data(), output_pos.data(), output_normals.data());
 }
 
-__global__ void compute_mesh_opt_gradients_kernel(uint32_t n_verts, float thresh, const Eigen::Vector3f *verts, const Eigen::Vector3f *normals, const Eigen::Vector4f *verts_smoothed,
-	uint32_t padded_output_width, const __half *densities,
-	uint32_t input_gradient_width, const float *input_gradients, Eigen::Vector3f *verts_gradient_out,
-	float k_smooth_amount,	float k_density_amount,	float k_inflate_amount
+__global__ void compute_mesh_opt_gradients_kernel(
+	uint32_t n_verts,
+	float thresh,
+	const vec3* verts,
+	const vec3* normals,
+	const vec4* verts_smoothed,
+	const network_precision_t* densities,
+	uint32_t input_gradient_width,
+	const float* input_gradients,
+	vec3* verts_gradient_out,
+	float k_smooth_amount,
+	float k_density_amount,
+	float k_inflate_amount
 ) {
 	uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= n_verts) return;
 
-	Eigen::Vector3f src = verts[i];
-	Eigen::Vector4f p = verts_smoothed[i];
+	vec3 src = verts[i];
+	vec4 p = verts_smoothed[i];
 
-	if (p.w() <= 0.f) {
-		p.w() = 1.f;
+	if (p.w <= 0.f) {
+		p.w = 1.f;
 	}
 
-	Eigen::Vector3f target=p.head<3>() * (1.f/p.w());
-	Eigen::Vector3f smoothing_grad = src - target; // negative...
+	vec3 target = p.xyz() * (1.0f / p.w);
+	vec3 smoothing_grad = src - target; // negative...
 
-	Eigen::Vector3f input_gradient = *(const Eigen::Vector3f *)(input_gradients + i * input_gradient_width);
+	vec3 input_gradient = *(const vec3 *)(input_gradients + i * input_gradient_width);
 
-	Eigen::Vector3f n = input_gradient.normalized();
-	float density = densities[i * padded_output_width];
-	verts_gradient_out[i] = n * sign(density - thresh) * k_density_amount + smoothing_grad * k_smooth_amount - normals[i].normalized() * k_inflate_amount;
+	vec3 n = normalize(input_gradient);
+	float density = densities[i];
+	verts_gradient_out[i] = n * sign(density - thresh) * k_density_amount + smoothing_grad * k_smooth_amount - normalize(normals[i]) * k_inflate_amount;
 }
 
-void compute_mesh_opt_gradients(float thresh,
-	const tcnn::GPUMemory<Eigen::Vector3f> &verts, const tcnn::GPUMemory<Eigen::Vector3f> &normals,
-	const tcnn::GPUMemory<Eigen::Vector4f> &verts_smoothed,
-	uint32_t padded_output_width, const __half *densities,
-	uint32_t input_gradients_width, const float *input_gradients,
-	GPUMemory<Eigen::Vector3f> &verts_gradient_out,
-	float k_smooth_amount,	float k_density_amount,	float k_inflate_amount
+void compute_mesh_opt_gradients(
+	float thresh,
+	const GPUMemory<vec3>& verts,
+	const GPUMemory<vec3>& normals,
+	const GPUMemory<vec4>& verts_smoothed,
+	const network_precision_t* densities,
+	uint32_t input_gradients_width,
+	const float* input_gradients,
+	GPUMemory<vec3>& verts_gradient_out,
+	float k_smooth_amount,
+	float k_density_amount,
+	float k_inflate_amount
 ) {
 	linear_kernel(
 		compute_mesh_opt_gradients_kernel,
@@ -720,7 +761,6 @@ void compute_mesh_opt_gradients(float thresh,
 		verts.data(),
 		normals.data(),
 		verts_smoothed.data(),
-		padded_output_width,
 		densities,
 		input_gradients_width,
 		input_gradients,
@@ -731,189 +771,341 @@ void compute_mesh_opt_gradients(float thresh,
 	);
 }
 
-void marching_cubes_gpu(BoundingBox aabb, Eigen::Vector3i res_3d, float thresh, const tcnn::GPUMemory<float> &density, tcnn::GPUMemory<Eigen::Vector3f> &verts_out, tcnn::GPUMemory<uint32_t> &indices_out) {
+void marching_cubes_gpu(cudaStream_t stream, BoundingBox render_aabb, mat3 render_aabb_to_local, ivec3 res_3d, float thresh, const GPUMemory<float>& density, GPUMemory<vec3>& verts_out, GPUMemory<uint32_t>& indices_out) {
 	GPUMemory<uint32_t> counters;
 
 	counters.enlarge(4);
 	counters.memset(0);
 
-	GPUMemory<int> vertex_grid;
-	vertex_grid.enlarge(res_3d.x()*res_3d.y()*res_3d.z()*3);
-	vertex_grid.memset(-1);
+	size_t n_bytes = res_3d.x * (size_t)res_3d.y * res_3d.z * 3 * sizeof(int);
+	auto workspace = allocate_workspace(stream, n_bytes);
+	CUDA_CHECK_THROW(cudaMemsetAsync(workspace.data(), -1, n_bytes, stream));
+
+	int* vertex_grid = (int*)workspace.data();
 
 	const dim3 threads = { 4, 4, 4 };
-	const dim3 blocks = { div_round_up((uint32_t)res_3d.x(), threads.x), div_round_up((uint32_t)res_3d.y(), threads.y), div_round_up((uint32_t)res_3d.z(), threads.z) };
+	const dim3 blocks = { div_round_up((uint32_t)res_3d.x, threads.x), div_round_up((uint32_t)res_3d.y, threads.y), div_round_up((uint32_t)res_3d.z, threads.z) };
 	// count only
-	gen_vertices<<<blocks, threads, 0>>>(aabb, res_3d, density.data(), nullptr, nullptr, thresh, counters.data());
+	gen_vertices<<<blocks, threads, 0>>>(render_aabb, render_aabb_to_local, res_3d, density.data(), nullptr, nullptr, thresh, counters.data());
 	gen_faces<<<blocks, threads, 0>>>(res_3d, density.data(), nullptr, nullptr, thresh, counters.data());
 	std::vector<uint32_t> cpucounters; cpucounters.resize(4);
 	counters.copy_to_host(cpucounters);
-	printf("%d vertices, %d triangles\n",cpucounters[0], cpucounters[1]/3);
+	tlog::info() << "#vertices=" << cpucounters[0] << " #triangles=" << (cpucounters[1]/3);
 
-	uint32_t n_verts=(cpucounters[0]+127)&~127; // round for later nn stuff
+	uint32_t n_verts = next_multiple(cpucounters[0], BATCH_SIZE_GRANULARITY); // round for later nn stuff
 	verts_out.resize(n_verts);
 	verts_out.memset(0);
 	indices_out.resize(cpucounters[1]);
+
 	// actually generate verts
-	gen_vertices<<<blocks, threads, 0>>>(aabb, res_3d, density.data(), vertex_grid.data(), verts_out.data(), thresh, counters.data()+2);
-	gen_faces<<<blocks, threads, 0>>>(res_3d, density.data(), vertex_grid.data(), indices_out.data(), thresh, counters.data()+2);
+	gen_vertices<<<blocks, threads, 0>>>(render_aabb, render_aabb_to_local, res_3d, density.data(), vertex_grid, verts_out.data(), thresh, counters.data()+2);
+	gen_faces<<<blocks, threads, 0>>>(res_3d, density.data(), vertex_grid, indices_out.data(), thresh, counters.data()+2);
 }
 
-void save_mesh(GPUMemory<Eigen::Vector3f> &verts, GPUMemory<Eigen::Vector3f> &normals, GPUMemory<uint32_t> &indices, const char *optional_outputname, bool unwrap_it, float nerf_scale, Eigen::Vector3f nerf_offset) {
-	if (optional_outputname) {
-		std::vector<Eigen::Vector3f> cpuverts; cpuverts.resize(verts.size());
-		std::vector<Eigen::Vector3f> cpunormals; cpunormals.resize(normals.size());
-		std::vector<uint32_t> cpuindices; cpuindices.resize(indices.size());
-		verts.copy_to_host(cpuverts);
-		normals.copy_to_host(cpunormals);
-		indices.copy_to_host(cpuindices);
+void save_mesh(
+	GPUMemory<vec3>& verts,
+	GPUMemory<vec3>& normals,
+	GPUMemory<vec3>& colors,
+	GPUMemory<uint32_t>& indices,
+	const fs::path& path,
+	bool unwrap_it,
+	float nerf_scale,
+	vec3 nerf_offset
+) {
+	std::vector<vec3> cpuverts; cpuverts.resize(verts.size());
+	std::vector<vec3> cpunormals; cpunormals.resize(normals.size());
+	std::vector<vec3> cpucolors; cpucolors.resize(colors.size());
+	std::vector<uint32_t> cpuindices; cpuindices.resize(indices.size());
+	verts.copy_to_host(cpuverts);
+	normals.copy_to_host(cpunormals);
+	colors.copy_to_host(cpucolors);
+	indices.copy_to_host(cpuindices);
 
-		FILE *f=fopen(optional_outputname,"w");
-		if (f) {
-			uint32_t numquads = ((cpuindices.size()/3)+1)/2;
-			uint32_t numquadsx = uint32_t(sqrtf(numquads)+4) & (~3);
-			uint32_t numquadsy = (numquads+numquadsx-1)/numquadsx;
-			uint32_t quadresy = 8;
-			uint32_t quadresx = quadresy+3;
-			uint32_t texw = quadresx*numquadsx;
-			uint32_t texh = quadresy*numquadsy;
-			if (unwrap_it) {
-				fprintf(f, "mtllib nerf.mtl\n");
-				uint8_t *tex=(uint8_t*)malloc(texw*texh*3);
-				for (uint32_t y=0;y<texh;++y) {
-					for (uint32_t x=0;x<texw;++x) {
-						uint32_t q=(x/quadresx)+(y/quadresy)*numquadsx;
-						// 0 x x 3 - - 4
-						// | .\x x\. . |
-						// | . .\x x\. |
-						// 2 - - 1 x x 5
-						uint32_t xi = x % quadresx, yi = y % quadresy;
-						uint32_t t = q*2 + (xi>yi+1);
-						int r=(t*923)&255;
-						int g=(t*3572)&255;
-						int b=(t*5423)&255;
-						//if (xi==yi+1 || xi==yi+2)
-						//	r=g=b=0;
-						tex[x*3+y*3*texw+0]=r;
-						tex[x*3+y*3*texw+1]=g;
-						tex[x*3+y*3*texw+2]=b;
-					}
-				}
-				stbi_write_tga("nerf.tga", texw, texh, 3, tex);
-				free(tex);
+	// Replace invalid values with reasonable defaults
+	for (size_t i = 0; i < cpuverts.size(); ++i) {
+		if (!all(isfinite(cpuverts[i]))) cpuverts[i] = vec3(0.0f);
+		if (!all(isfinite(cpunormals[i]))) cpunormals[i] = vec3{0.0f, 1.0f, 0.0f};
+		if (!all(isfinite(cpucolors[i]))) cpucolors[i] = vec3(0.0f);
+	}
+
+	uint32_t numquads = ((cpuindices.size()/3)+1)/2;
+	uint32_t numquadsx = uint32_t(sqrtf(numquads)+4) & (~3);
+	uint32_t numquadsy = (numquads+numquadsx-1)/numquadsx;
+	uint32_t quadresy = 8;
+	uint32_t quadresx = quadresy+3;
+	uint32_t texw = quadresx*numquadsx;
+	uint32_t texh = quadresy*numquadsy;
+
+	if (unwrap_it) {
+		uint8_t* tex = (uint8_t*)malloc(texw*texh*3);
+		for (uint32_t y = 0; y < texh; ++y) {
+			for (uint32_t x = 0; x < texw; ++x) {
+				uint32_t q = (x/quadresx)+(y/quadresy)*numquadsx;
+				// 0 x x 3 - - 4
+				// | .\x x\. . |
+				// | . .\x x\. |
+				// 2 - - 1 x x 5
+				uint32_t xi = x % quadresx, yi = y % quadresy;
+				uint32_t t = q*2 + (xi>yi+1);
+				int r = (t*923)&255;
+				int g = (t*3572)&255;
+				int b = (t*5423)&255;
+				//if (xi==yi+1 || xi==yi+2)
+				//	r=g=b=0;
+				tex[x*3+y*3*texw+0]=r;
+				tex[x*3+y*3*texw+1]=g;
+				tex[x*3+y*3*texw+2]=b;
 			}
-			for (auto &v: cpuverts) {
-				Eigen::Vector3f p=(v-nerf_offset)/nerf_scale;
-				fprintf(f,"v %0.5f %0.5f %0.5f\n", p.x(), p.y(), p.z());
-			}
-			for (auto &v: cpunormals) {
-				auto n= v.normalized();
-				fprintf(f,"vn %0.5f %0.5f %0.5f\n", n.x(), n.y(), n.z());
-			}
-			if (unwrap_it) {
-				for (size_t i=0;i<cpuindices.size();i++) {
-					uint32_t q=(uint32_t)(i/6);
-					uint32_t x=(q%numquadsx)*quadresx;
-					uint32_t y=(q/numquadsx)*quadresy;
-					uint32_t d=quadresy-1;
-					switch (i%6) {
+		}
+
+		write_stbi(path.with_extension(".tga"), texw, texh, 3, tex);
+		free(tex);
+	}
+
+	FILE* f = native_fopen(path, "wb");
+	if (!f) {
+		throw std::runtime_error{fmt::format("Failed to open '{}' for writing", path.str())};
+	}
+
+	if (equals_case_insensitive(path.extension(), "ply")) {
+		// ply file
+		fprintf(f,
+			"ply\n"
+			"format ascii 1.0\n"
+			"comment output from https://github.com/NVlabs/instant-ngp\n"
+			"element vertex %u\n"
+			"property float x\n"
+			"property float y\n"
+			"property float z\n"
+			"property float nx\n"
+			"property float ny\n"
+			"property float nz\n"
+			"property uchar red\n"
+			"property uchar green\n"
+			"property uchar blue\n"
+			"element face %u\n"
+			"property list uchar int vertex_index\n"
+			"end_header\n"
+			, (unsigned int)cpuverts.size()
+			, (unsigned int)cpuindices.size()/3
+		);
+
+		for (size_t i=0;i<cpuverts.size();++i) {
+			vec3 p = (cpuverts[i]-nerf_offset)/nerf_scale;
+			vec3 c = cpucolors[i];
+			vec3 n = normalize(cpunormals[i]);
+			unsigned char c8[3] = {(unsigned char)clamp(c.x*255.f,0.f,255.f),(unsigned char)clamp(c.y*255.f,0.f,255.f),(unsigned char)clamp(c.z*255.f,0.f,255.f)};
+			fprintf(f, "%0.5f %0.5f %0.5f %0.3f %0.3f %0.3f %d %d %d\n", p.x, p.y, p.z, n.x, n.y, n.z, c8[0], c8[1], c8[2]);
+		}
+
+		for (size_t i = 0; i < cpuindices.size(); i += 3) {
+			fprintf(f, "3 %d %d %d\n", cpuindices[i+2], cpuindices[i+1], cpuindices[i+0]);
+		}
+	} else {
+		// obj file
+		if (unwrap_it) {
+			fprintf(f, "mtllib nerf.mtl\n");
+		}
+
+		for (size_t i = 0; i < cpuverts.size(); ++i) {
+			vec3 p = (cpuverts[i]-nerf_offset)/nerf_scale;
+			vec3 c = cpucolors[i];
+			fprintf(f, "v %0.5f %0.5f %0.5f %0.3f %0.3f %0.3f\n", p.x, p.y, p.z, clamp(c.x, 0.f, 1.f), clamp(c.y, 0.f, 1.f), clamp(c.z, 0.f, 1.f));
+		}
+
+		for (auto &v: cpunormals) {
+			auto n = normalize(v);
+			fprintf(f, "vn %0.5f %0.5f %0.5f\n", n.x, n.y, n.z);
+		}
+
+		if (unwrap_it) {
+			for (size_t i = 0; i < cpuindices.size(); i++) {
+				uint32_t q = (uint32_t)(i/6);
+				uint32_t x = (q%numquadsx)*quadresx;
+				uint32_t y = (q/numquadsx)*quadresy;
+				uint32_t d = quadresy-1;
+				switch (i % 6) {
 					case 0: break;
-					case 1: x+=d;y+=d; break;
-					case 2: y+=d; break;
-					case 3: x+=3; break;
-					case 4: x+=3+d; break;
-					case 5: x+=3+d; y+=d; break;
-					}
-					fprintf(f,"vt %0.5f %0.5f\n", ((float)x+0.5f)/float(texw), 1.f-((float)y+0.5f)/float(texh));
+					case 1: x += d; y += d; break;
+					case 2: y += d; break;
+					case 3: x += 3; break;
+					case 4: x += 3+d; break;
+					case 5: x += 3+d; y += d; break;
 				}
-				fprintf(f, "g default\nusemtl nerf\ns 1\n");
-				for (size_t i=0;i<cpuindices.size();i+=3) {
-					fprintf(f,"f %u/%u/%u %u/%u/%u %u/%u/%u\n",
-						cpuindices[i]+1,(uint32_t)i+1,  cpuindices[i]+1,
-						cpuindices[i+1]+1,(uint32_t)i+2,cpuindices[i+1]+1,
-						cpuindices[i+2]+1,(uint32_t)i+3,cpuindices[i+2]+1
-					);
-				}
-			} else {
-				for (size_t i=0;i<cpuindices.size();i+=3) {
-					fprintf(f,"f %u//%u %u//%u %u//%u\n",
-						cpuindices[i]+1,cpuindices[i]+1,cpuindices[i+1]+1,cpuindices[i+1]+1,cpuindices[i+2]+1,cpuindices[i+2]+1
-					);
-				}
+				fprintf(f, "vt %0.5f %0.5f\n", ((float)x+0.5f)/float(texw), 1.f-((float)y+0.5f)/float(texh));
 			}
-			fclose(f);
+
+			fprintf(f, "g default\nusemtl nerf\ns 1\n");
+			for (size_t i = 0; i < cpuindices.size(); i += 3) {
+				fprintf(f,"f %u/%u/%u %u/%u/%u %u/%u/%u\n",
+					cpuindices[i+2]+1,(uint32_t)i+3,  cpuindices[i+2]+1,
+					cpuindices[i+1]+1,(uint32_t)i+2,cpuindices[i+1]+1,
+					cpuindices[i+0]+1,(uint32_t)i+1,cpuindices[i+0]+1
+				);
+			}
+		} else {
+			for (size_t i = 0; i < cpuindices.size(); i += 3) {
+				fprintf(f, "f %u//%u %u//%u %u//%u\n",
+					cpuindices[i+2]+1, cpuindices[i+2]+1, cpuindices[i+1]+1, cpuindices[i+1]+1, cpuindices[i+0]+1, cpuindices[i+0]+1
+				);
+			}
 		}
 	}
+	fclose(f);
 }
 
-void save_density_grid_to_png(const GPUMemory<float> &density, const char *filename, Vector3i res3d, float thresh, bool swap_y_z) {
+void save_density_grid_to_png(const GPUMemory<float>& density, const fs::path& path, ivec3 res3d, float thresh, bool swap_y_z, float density_range) {
+	float density_scale = 128.f / density_range; // map from -density_range to density_range into 0-255
 	std::vector<float> density_cpu;
 	density_cpu.resize(density.size());
 	density.copy_to_host(density_cpu);
-	uint32_t num_voxels=0;
-	uint32_t num_lattice_points_near_zero_crossing=0;
-	for (int z=1;z<res3d.z()-1;++z) {
-		for (int y=1;y<res3d.y()-1;++y) {
-			for (int x=1;x<res3d.z()-1;++x) {
+	uint32_t num_voxels = 0;
+	uint32_t num_lattice_points_near_zero_crossing = 0;
+	uint32_t N = res3d.x*res3d.y*res3d.z;
+	for (int z = 1; z < res3d.z - 1; ++z) {
+		for (int y = 1; y < res3d.y - 1; ++y) {
+			for (int x = 1; x < res3d.x - 1; ++x) {
 				int count = 0;
-				count += density_cpu[(x+0)+(y+0)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh;
-				count += density_cpu[(x+1)+(y+0)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh;
-				count += density_cpu[(x+0)+(y+1)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh;
-				count += density_cpu[(x+1)+(y+1)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh;
-				count += density_cpu[(x+0)+(y+0)*res3d.x()+(z+1)*res3d.x()*res3d.z()] < thresh;
-				count += density_cpu[(x+1)+(y+0)*res3d.x()+(z+1)*res3d.x()*res3d.z()] < thresh;
-				count += density_cpu[(x+0)+(y+1)*res3d.x()+(z+1)*res3d.x()*res3d.z()] < thresh;
-				count += density_cpu[(x+1)+(y+1)*res3d.x()+(z+1)*res3d.x()*res3d.z()] < thresh;
+				count += density_cpu[(x+0)+(y+0)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh;
+				count += density_cpu[(x+1)+(y+0)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh;
+				count += density_cpu[(x+0)+(y+1)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh;
+				count += density_cpu[(x+1)+(y+1)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh;
+				count += density_cpu[(x+0)+(y+0)*res3d.x+(z+1)*res3d.x*res3d.y] < thresh;
+				count += density_cpu[(x+1)+(y+0)*res3d.x+(z+1)*res3d.x*res3d.y] < thresh;
+				count += density_cpu[(x+0)+(y+1)*res3d.x+(z+1)*res3d.x*res3d.y] < thresh;
+				count += density_cpu[(x+1)+(y+1)*res3d.x+(z+1)*res3d.x*res3d.y] < thresh;
 				if (count>0 && count<8) {
 					num_voxels++;
 				}
 
-				bool mysign = density_cpu[(x+0)+(y+0)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh;
+				bool mysign = density_cpu[(x+0)+(y+0)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh;
 				bool near_zero_crossing=false;
-				near_zero_crossing|=(density_cpu[(x+1)+(y+0)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh) != mysign;
-				near_zero_crossing|=(density_cpu[(x-1)+(y+0)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh) != mysign;
-				near_zero_crossing|=(density_cpu[(x+0)+(y+1)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh) != mysign;
-				near_zero_crossing|=(density_cpu[(x+0)+(y-1)*res3d.x()+(z+0)*res3d.x()*res3d.z()] < thresh) != mysign;
-				near_zero_crossing|=(density_cpu[(x+0)+(y+0)*res3d.x()+(z+1)*res3d.x()*res3d.z()] < thresh) != mysign;
-				near_zero_crossing|=(density_cpu[(x+0)+(y+0)*res3d.x()+(z-1)*res3d.x()*res3d.z()] < thresh) != mysign;
-				if (near_zero_crossing)
+				near_zero_crossing |= (density_cpu[(x+1)+(y+0)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh) != mysign;
+				near_zero_crossing |= (density_cpu[(x-1)+(y+0)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh) != mysign;
+				near_zero_crossing |= (density_cpu[(x+0)+(y+1)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh) != mysign;
+				near_zero_crossing |= (density_cpu[(x+0)+(y-1)*res3d.x+(z+0)*res3d.x*res3d.y] < thresh) != mysign;
+				near_zero_crossing |= (density_cpu[(x+0)+(y+0)*res3d.x+(z+1)*res3d.x*res3d.y] < thresh) != mysign;
+				near_zero_crossing |= (density_cpu[(x+0)+(y+0)*res3d.x+(z-1)*res3d.x*res3d.y] < thresh) != mysign;
+				if (near_zero_crossing) {
 					num_lattice_points_near_zero_crossing++;
+				}
 			}
 		}
 	}
-	uint32_t N = res3d.x()*res3d.y()*res3d.z();
-	printf("%u lattice points\n", N);
-	printf("%u (%0.2f%%) voxels have a zero crossing\n", num_voxels, (num_voxels*100.0)/N);
-	printf("%u (%0.2f%%) lattice points are near a zero crossing\n", num_lattice_points_near_zero_crossing, (num_lattice_points_near_zero_crossing*100.0)/N );
+
 
 	if (swap_y_z) {
-		res3d = {res3d.x(), res3d.z(), res3d.y()};
+		res3d = {res3d.x, res3d.z, res3d.y};
 	}
-	uint32_t ndown = uint32_t(sqrtf(res3d.z()));
-	uint32_t nacross = (res3d.z()+ndown-1)/ndown;
-	uint32_t w=res3d.x() * nacross;
-	uint32_t h=res3d.y() * ndown;
-	uint8_t *pngpixels = (uint8_t *)malloc(size_t(w)*size_t(h));
-	uint8_t *dst=pngpixels;
-	for (int v=0;v<h;++v) {
-		for (int u=0;u<w;++u) {
-			int x=u%res3d.x();
-			int y=v%res3d.y();
-			int z=(u/res3d.x()) + (v/res3d.y()) * nacross;
-			if (z<res3d.z()) {
+
+	uint32_t ndown = uint32_t(sqrtf(res3d.z));
+	uint32_t nacross = (res3d.z+ndown-1)/ndown;
+	uint32_t w = res3d.x * nacross;
+	uint32_t h = res3d.y * ndown;
+	uint8_t* pngpixels = (uint8_t *)malloc(size_t(w)*size_t(h));
+	uint8_t* dst = pngpixels;
+	for (int v = 0; v < h; ++v) {
+		for (int u = 0; u < w; ++u) {
+			int x = u % res3d.x;
+			int y = v % res3d.y;
+			int z = (u / res3d.x) + (v / res3d.y) * nacross;
+			if (z < res3d.z) {
 				if (swap_y_z) {
-					*dst++ = (uint8_t)tcnn::clamp((density_cpu[x+z*res3d.x()+y*res3d.x()*res3d.z()]-thresh)*32.f + 128.5f, 0.f, 255.f);
+					*dst++ = (uint8_t)clamp((density_cpu[x + z*res3d.x + y*res3d.x*res3d.z]-thresh)*density_scale + 128.5f, 0.f, 255.f);
 				} else {
-					*dst++ = (uint8_t)tcnn::clamp((density_cpu[x+(res3d.y()-1-y)*res3d.x()+z*res3d.x()*res3d.y()]-thresh)*32.f + 128.5f, 0.f, 255.f);
+					*dst++ = (uint8_t)clamp((density_cpu[x + (res3d.y-1-y)*res3d.x + z*res3d.x*res3d.y]-thresh)*density_scale + 128.5f, 0.f, 255.f);
 				}
 			} else {
 				*dst++ = 0;
 			}
 		}
 	}
-	stbi_write_png(filename, w, h, 1, pngpixels, w);
+
+	write_stbi(path, w, h, 1, pngpixels);
+
+	tlog::success() << "Wrote density PNG to " << path.str();
+	tlog::info()
+		<< "  #lattice points=" << N
+		<< " #zero-x voxels=" << num_voxels << " (" << ((num_voxels*100.0)/N) << "%%)"
+		<< " #lattice near zero-x=" << num_lattice_points_near_zero_crossing << " (" << ((num_lattice_points_near_zero_crossing*100.0)/N) << "%%)";
+
 	free(pngpixels);
 }
 
-NGP_NAMESPACE_END
+// Distinct from `save_density_grid_to_png` not just in that is writes RGBA, but also
+// in that it writes a sequence of PNGs rather than a single large PNG.
+// TODO: make both methods configurable to do either single PNG or PNG sequence.
+void save_rgba_grid_to_png_sequence(const GPUMemory<vec4>& rgba, const fs::path& path, ivec3 res3d, bool swap_y_z) {
+	std::vector<vec4> rgba_cpu;
+	rgba_cpu.resize(rgba.size());
+	rgba.copy_to_host(rgba_cpu);
 
+	if (swap_y_z) {
+		res3d = {res3d.x, res3d.z, res3d.y};
+	}
+
+	uint32_t w = res3d.x;
+	uint32_t h = res3d.y;
+
+	auto progress = tlog::progress(res3d.z);
+
+	std::atomic<int> n_saved{0};
+	ThreadPool{}.parallel_for<int>(0, res3d.z, [&](int z) {
+		uint8_t* pngpixels = (uint8_t*)malloc(size_t(w) * size_t(h) * 4);
+		uint8_t* dst = pngpixels;
+		for (int y = 0; y < h; ++y) {
+			for (int x = 0; x < w; ++x) {
+				size_t i = swap_y_z ? (x + z*res3d.x + y*res3d.x*res3d.z) : (x + (res3d.y-1-y)*res3d.x + z*res3d.x*res3d.y);
+				*dst++ = (uint8_t)clamp(rgba_cpu[i].x * 255.f, 0.f, 255.f);
+				*dst++ = (uint8_t)clamp(rgba_cpu[i].y * 255.f, 0.f, 255.f);
+				*dst++ = (uint8_t)clamp(rgba_cpu[i].z * 255.f, 0.f, 255.f);
+				*dst++ = (uint8_t)clamp(rgba_cpu[i].w * 255.f, 0.f, 255.f);
+			}
+		}
+
+		write_stbi(path / fmt::format("{:04d}_{}x{}.png", z, w, h), w, h, 4, pngpixels);
+		free(pngpixels);
+
+		progress.update(++n_saved);
+	});
+	tlog::success() << "Wrote RGBA PNG sequence to " << path;
+}
+
+void save_rgba_grid_to_raw_file(const GPUMemory<vec4>& rgba, const fs::path& path, ivec3 res3d, bool swap_y_z, int cascade) {
+	std::vector<vec4> rgba_cpu;
+	rgba_cpu.resize(rgba.size());
+	rgba.copy_to_host(rgba_cpu);
+
+	if (swap_y_z) {
+		res3d = {res3d.x, res3d.z, res3d.y};
+	}
+
+	uint32_t w = res3d.x;
+	uint32_t h = res3d.y;
+	uint32_t d = res3d.z;
+
+	auto actual_path = path / fmt::format("{}x{}x{}_{}.bin", w, h, d, cascade);
+	FILE* f = native_fopen(actual_path, "wb");
+	if (!f)
+		return ;
+	const static float zero[4]={0.f,0.f,0.f,0.f};
+	int border = 1; // extra ring of voxels to make the donut hole smaller
+	for (int z = 0; z < d; ++z) {
+		for (int y = 0; y < h; ++y) {
+			for (int x = 0; x < w; ++x) {
+				size_t i = swap_y_z ? (x + z*res3d.x + y*res3d.x*res3d.z) : (x + (res3d.y-1-y)*res3d.x + z*res3d.x*res3d.y);
+				float* rgba = (float*)&rgba_cpu[i];
+				// the intention is that if cascade > 0, we have set up the render aabb such that we are outputing exactly one cascade of the nerf
+				// we then punch a transparent hole in the middle of each cascade, so that they fit together when placed on top of each other.
+				if (cascade && x>=res3d.x/4+border && y>=res3d.y/4+border && z>=res3d.z/4+border && x<res3d.x-res3d.x/4-border && y<res3d.y-res3d.y/4-border && z<res3d.z-res3d.z/4-border)
+					fwrite(zero, sizeof(float), 4, f);
+				else
+					fwrite(rgba, sizeof(float), 4, f);
+			}
+		}
+	}
+	fclose(f);
+	tlog::success() << "Wrote RGBA raw file to " << actual_path.str();
+}
+
+}
